@@ -32,11 +32,19 @@ from bob.tty import colorize
 from pipes import quote
 
 # scan package recursivelely with its dependencies and build a list of checkout dirs
-def getCheckOutDirs(package, dirs):
+def getCheckOutDirs(package, excludes, dirs):
     if package.getCheckoutStep().isValid():
         dirs.append([package.getName(), package.getCheckoutStep().getWorkspacePath()])
+
     for d in package.getDirectDepSteps():
-        getCheckOutDirs(d.getPackage(), dirs)
+        excluded = False
+        for e in excludes:
+            if (e.match(d.getPackage().getName())):
+                excluded = True
+                break
+
+        if not excluded:
+            getCheckOutDirs(d.getPackage(), excludes, dirs)
 
 def generateFile(entries, fileName):
     try:
@@ -150,6 +158,8 @@ def qtProjectGenerator(package, argv, extra):
         help="Additional include directories. (added recursive starting from this directory)")
     parser.add_argument('-f', '--filter', metavar="Filter",
         help="File filter. A regex for matching additional files.")
+    parser.add_argument('--exclude', default=[], action='append', dest="excludes",
+            help="Packages will be excluded in QTCreator.")
     parser.add_argument('--kit',
         help="Kit to use for this project")
 
@@ -162,7 +172,12 @@ def qtProjectGenerator(package, argv, extra):
     project = "/".join(package.getStack())
 
     dirs = []
-    getCheckOutDirs(package, dirs)
+    excludes = []
+    if args.excludes:
+        for e in args.excludes:
+            excludes.append(re.compile(e))
+
+    getCheckOutDirs(package, excludes, dirs)
     if not projectName:
         # use package name for project name
         projectName = package.getName()
@@ -298,6 +313,9 @@ def qtProjectGenerator(package, argv, extra):
             projectCmd += " -I " + quote(i)
         if args.filter:
             projectCmd += " --filter " + quote(args.filter)
+        if args.excludes:
+            for e in args.excludes:
+                projectCmd += " --exclude " + quote(e)
 
         buildMe.append(projectCmd)
         generateFile(buildMe, buildMeFile)
