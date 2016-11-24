@@ -111,8 +111,9 @@ def addBuildSteps(outFile, buildMeFile, buildConfigs):
     addBuildConfig(outFile, 3, "Bob dev (no deps)", "-n", buildMeFile)
     addBuildConfig(outFile, 4, "Bob dev (no checkout, no deps)", "-nb", buildMeFile)
     addBuildConfig(outFile, 5, "Bob dev (no checkout, clean)", "-b --clean", buildMeFile)
+    addBuildConfig(outFile, 6, "Bob dev (no checkout, debug)", "-b -DCMAKE_BUILD_TYPE='DEBUG'", buildMeFile)
 
-    count = 6
+    count = 7
     for name,flags in buildConfigs:
         addBuildConfig(outFile, count, name, flags, buildMeFile)
         count += 1
