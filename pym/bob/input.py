@@ -528,7 +528,7 @@ fi
         else:
             return self.__url + " refs/heads/" + self.__branch + " " + self.__dir
 
-    def asJenkins(self, workPath, credentials):
+    def asJenkins(self, workPath, credentials, options):
         scm = xml.etree.ElementTree.Element("scm", attrib={
             "class" : "hudson.plugins.git.GitSCM",
             "plugin" : "git@2.2.7",
@@ -575,6 +575,21 @@ fi
         # remove untracked files
         xml.etree.ElementTree.SubElement(extensions,
             "hudson.plugins.git.extensions.impl.CleanCheckout")
+        shallow = options.get("scm.git.shallow")
+        if shallow is not None:
+            try:
+                shallow = int(shallow)
+                if shallow < 0: raise ValueError()
+            except ValueError:
+                raise BuildError("Invalid 'git.shallow' option: " + str(shallow))
+            if shallow > 0:
+                co = xml.etree.ElementTree.SubElement(extensions,
+                    "hudson.plugins.git.extensions.impl.CloneOption")
+                xml.etree.ElementTree.SubElement(co, "shallow").text = "true"
+                xml.etree.ElementTree.SubElement(co, "noTags").text = "false"
+                xml.etree.ElementTree.SubElement(co, "reference").text = ""
+                xml.etree.ElementTree.SubElement(co, "depth").text = str(shallow)
+                xml.etree.ElementTree.SubElement(co, "honorRefspec").text = "false"
 
         return scm
 
@@ -739,7 +754,7 @@ fi
         """
         return "\n".join([ SvnScm.__moduleAsDigestScript(m) for m in self.__modules ])
 
-    def asJenkins(self, workPath, credentials):
+    def asJenkins(self, workPath, credentials, options):
         scm = xml.etree.ElementTree.Element("scm", attrib={
             "class" : "hudson.scm.SubversionSCM",
             "plugin" : "subversion@2.4.5",
@@ -1607,8 +1622,8 @@ class CheckoutStep(Step):
         else:
             return None
 
-    def getJenkinsXml(self, credentials):
-        return [ s.asJenkins(self.getWorkspacePath(), credentials)
+    def getJenkinsXml(self, credentials, options):
+        return [ s.asJenkins(self.getWorkspacePath(), credentials, options)
                  for s in self.__scmList if s.hasJenkinsPlugin() ]
 
     def getScmList(self):

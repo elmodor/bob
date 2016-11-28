@@ -323,7 +323,7 @@ class JenkinsJob:
     def _buildIdName(d):
         return d.getWorkspacePath().replace('/', '_') + ".buildid"
 
-    def dumpXML(self, orig, nodes, windows, credentials, clean):
+    def dumpXML(self, orig, nodes, windows, credentials, clean, options):
         if orig:
             root = xml.etree.ElementTree.fromstring(orig)
             builders = root.find("builders")
@@ -331,6 +331,8 @@ class JenkinsJob:
             triggers = root.find("triggers")
             revBuild = triggers.find("jenkins.triggers.ReverseBuildTrigger")
             if revBuild is not None: triggers.remove(revBuild)
+            scmTrigger = triggers.find("hudson.triggers.SCMTrigger")
+            if scmTrigger is not None: triggers.remove(scmTrigger)
             publishers = root.find("publishers")
             archiver = publishers.find("hudson.tasks.ArtifactArchiver")
             if archiver is None:
@@ -379,15 +381,18 @@ class JenkinsJob:
                 root, "concurrentBuild").text = "false"
             builders = xml.etree.ElementTree.SubElement(root, "builders")
             triggers = xml.etree.ElementTree.SubElement(root, "triggers")
-            scmTrigger = xml.etree.ElementTree.SubElement(
-                triggers, "hudson.triggers.SCMTrigger")
-            xml.etree.ElementTree.SubElement(scmTrigger, "spec").text = ""
-            xml.etree.ElementTree.SubElement(
-                scmTrigger, "ignorePostCommitHooks").text = "false"
             publishers = xml.etree.ElementTree.SubElement(root, "publishers")
             archiver = xml.etree.ElementTree.SubElement(
                 publishers, "hudson.tasks.ArtifactArchiver")
             buildWrappers = xml.etree.ElementTree.SubElement(root, "buildWrappers")
+
+        scmTrigger = xml.etree.ElementTree.SubElement(
+            triggers, "hudson.triggers.SCMTrigger")
+        xml.etree.ElementTree.SubElement(scmTrigger, "spec").text = options.get("scm.poll")
+        xml.etree.ElementTree.SubElement(
+            scmTrigger, "ignorePostCommitHooks").text = "false"
+
+        sharedDir = options.get("shared.dir", "${JENKINS_HOME}/bob")
 
         prepareCmds = []
         prepareCmds.append(self.getShebang(windows))
@@ -467,7 +472,7 @@ class JenkinsJob:
                             "class" : "org.jenkins_ci.plugins.run_condition.core.FileExistsCondition"
                         })
                     xml.etree.ElementTree.SubElement(
-                        fileCond, "file").text = "${JENKINS_HOME}/bob/"+vid[0:2]+"/"+vid[2:]
+                        fileCond, "file").text = sharedDir+"/"+vid[0:2]+"/"+vid[2:]
                     xml.etree.ElementTree.SubElement(
                         fileCond, "baseDir", attrib={
                             "class" : "org.jenkins_ci.plugins.run_condition.common.BaseDirectory$Workspace"
@@ -508,17 +513,19 @@ class JenkinsJob:
                 if d.isShared():
                     vid = asHexStr(d.getVariantId())
                     prepareCmds.append(textwrap.dedent("""\
-                        if [ ! -d ${{JENKINS_HOME}}/bob/{VID1}/{VID2} ] ; then
-                            T=$(mktemp -d -p ${{JENKINS_HOME}})
+                        if [ ! -d {SHARED}/{VID1}/{VID2} ] ; then
+                            mkdir -p {SHARED}
+                            T=$(mktemp -d -p {SHARED})
                             tar xf {TGZ} -C $T
-                            mkdir -p ${{JENKINS_HOME}}/bob/{VID1}
-                            mv -T $T ${{JENKINS_HOME}}/bob/{VID1}/{VID2} || rm -rf $T
+                            mkdir -p {SHARED}/{VID1}
+                            mv -T $T {SHARED}/{VID1}/{VID2} || rm -rf $T
                         fi
                         mkdir -p {WSP_DIR}
-                        ln -sfT ${{JENKINS_HOME}}/bob/{VID1}/{VID2} {WSP_PATH}
+                        ln -sfT {SHARED}/{VID1}/{VID2} {WSP_PATH}
                         """.format(VID1=vid[0:2], VID2=vid[2:], TGZ=JenkinsJob._tgzName(d),
                                    WSP_DIR=os.path.dirname(d.getWorkspacePath()),
-                                   WSP_PATH=d.getWorkspacePath())))
+                                   WSP_PATH=d.getWorkspacePath(),
+                                   SHARED=sharedDir)))
                 else:
                     prepareCmds.append("mkdir -p " + d.getWorkspacePath())
                     prepareCmds.append("tar zxf {} -C {}".format(
@@ -535,7 +542,7 @@ class JenkinsJob:
                 builders, "hudson.tasks.Shell")
             xml.etree.ElementTree.SubElement(
                 checkout, "command").text = self.dumpStep(d, windows, False)
-            checkoutSCMs.extend(d.getJenkinsXml(credentials))
+            checkoutSCMs.extend(d.getJenkinsXml(credentials, options))
 
         if len(checkoutSCMs) > 1:
             scm = xml.etree.ElementTree.SubElement(
@@ -612,12 +619,14 @@ class JenkinsJob:
                 vid = asHexStr(d.getVariantId())
                 installCmds.append(textwrap.dedent("""\
                 # install shared package atomically
-                if [ ! -d ${{JENKINS_HOME}}/bob/{VID1}/{VID2} ] ; then
-                    T=$(mktemp -d -p ${{JENKINS_HOME}})
+                if [ ! -d {SHARED}/{VID1}/{VID2} ] ; then
+                    mkdir -p {SHARED}
+                    T=$(mktemp -d -p {SHARED})
                     tar xf {TGZ} -C $T
-                    mkdir -p ${{JENKINS_HOME}}/bob/{VID1}
-                    mv -T $T ${{JENKINS_HOME}}/bob/{VID1}/{VID2} || rm -rf $T
-                fi""".format(TGZ=JenkinsJob._tgzName(d), VID1=vid[0:2], VID2=vid[2:])))
+                    mkdir -p {SHARED}/{VID1}
+                    mv -T $T {SHARED}/{VID1}/{VID2} || rm -rf $T
+                fi""".format(TGZ=JenkinsJob._tgzName(d), VID1=vid[0:2], VID2=vid[2:],
+                             SHARED=sharedDir)))
         if installCmds:
             installCmds.insert(0, self.getShebang(windows))
             install = xml.etree.ElementTree.SubElement(
@@ -822,6 +831,8 @@ def genJenkinsBuildOrder(jobs):
 def doJenkinsAdd(recipes, argv):
     parser = argparse.ArgumentParser(prog="bob jenkins add")
     parser.add_argument("-n", "--nodes", default="", help="Label for Jenkins Slave")
+    parser.add_argument("-o", default=[], action='append', dest='options',
+                        help="Set extended Jenkins options")
     parser.add_argument("-w", "--windows", default=False, action='store_true', help="Jenkins is running on Windows. Produce cygwin compatible scripts.")
     parser.add_argument("-p", "--prefix", default="", help="Prefix for jobs")
     parser.add_argument("-r", "--root", default=[], action='append',
@@ -853,6 +864,14 @@ def doJenkinsAdd(recipes, argv):
         else:
             parser.error("Malformed define: "+define)
 
+    options = {}
+    for i in args.options:
+        (opt, sep, val) = i.partition("=")
+        if sep != "=":
+            parser.error("Malformed plugin option: "+i)
+        if val != "":
+            options[opt] = val
+
     if args.name in BobState().getAllJenkins():
         print("Jenkins '{}' already added.".format(args.name), file=sys.stderr)
         sys.exit(1)
@@ -881,6 +900,7 @@ def doJenkinsAdd(recipes, argv):
         "credentials" : args.credentials,
         "clean" : args.clean,
         "keep" : args.keep,
+        "options" : options
     }
     BobState().addJenkins(args.name, config)
 
@@ -907,6 +927,7 @@ def doJenkinsExport(recipes, argv):
     nodes = config.get("nodes", "")
     credentials = config.get("credentials")
     clean = config.get("clean", False)
+    options = config.get("options", {})
     for j in sorted(jobs.keys()):
         job = jobs[j]
         info = {
@@ -924,7 +945,7 @@ def doJenkinsExport(recipes, argv):
         BobState().setAsynchronous()
         try:
             xml = applyHooks(jenkinsJobCreate, job.dumpXML(None, nodes, windows,
-                credentials, clean), info)
+                credentials, clean, options), info)
         finally:
             BobState().setSynchronous()
         with open(os.path.join(args.dir, job.getName()+".xml"), "wb") as f:
@@ -956,23 +977,26 @@ def doJenkinsLs(recipes, argv):
         print(j)
         cfg = BobState().getJenkinsConfig(j)
         if args.verbose >= 1:
-            print(" URL:", getUrl(cfg))
+            print("    URL:", getUrl(cfg))
+            print("    Roots:", ", ".join(cfg['roots']))
             if cfg.get('prefix'):
-                print(" Prefix:", cfg['prefix'])
+                print("    Prefix:", cfg['prefix'])
             if cfg.get('nodes'):
-                print(" Nodes:", cfg['nodes'])
+                print("    Nodes:", cfg['nodes'])
             if cfg.get('defines'):
-                print(" Defines:", ", ".join([ k+"="+v for (k,v) in cfg['defines'].items() ]))
-            print(" Obsolete jobs:", "keep" if cfg.get('keep', False) else "delete")
-            print(" Download:", "enabled" if cfg.get('download', False) else "disabled")
-            print(" Upload:", "enabled" if cfg.get('upload', False) else "disabled")
-            print(" Clean builds:", "enabled" if cfg.get('clean', False) else "disabled")
-            print(" Sandbox:", "enabled" if cfg.get("sandbox", False) else "disabled")
-            print(" Roots:", ", ".join(cfg['roots']))
+                print("    Defines:", ", ".join([ k+"="+v for (k,v) in cfg['defines'].items() ]))
+            print("    Obsolete jobs:", "keep" if cfg.get('keep', False) else "delete")
+            print("    Download:", "enabled" if cfg.get('download', False) else "disabled")
+            print("    Upload:", "enabled" if cfg.get('upload', False) else "disabled")
+            print("    Clean builds:", "enabled" if cfg.get('clean', False) else "disabled")
+            print("    Sandbox:", "enabled" if cfg.get("sandbox", False) else "disabled")
             if cfg.get('credentials'):
-                print(" Credentials:", cfg['credentials'])
+                print("    Credentials:", cfg['credentials'])
+            options = cfg.get('options')
+            if options:
+                print("    Extended options:", ", ".join([ k+"="+v for (k,v) in options.items() ]))
         if args.verbose >= 2:
-            print(" Jobs:", ", ".join(sorted(BobState().getJenkinsAllJobs(j))))
+            print("    Jobs:", ", ".join(sorted(BobState().getJenkinsAllJobs(j))))
 
 def getUrl(config):
     url = config["url"]
@@ -1265,6 +1289,7 @@ def doJenkinsPush(recipes, argv):
     credentials = config.get("credentials")
     clean = config.get("clean", False)
     keep = config.get("keep", False)
+    options = config.get("options", {})
     updatedJobs = {}
     verbose = args.verbose - args.quiet
 
@@ -1322,7 +1347,7 @@ def doJenkinsPush(recipes, argv):
                 else:
                     jobXML = None
 
-                jobXML = job.dumpXML(jobXML, nodes, windows, credentials, clean)
+                jobXML = job.dumpXML(jobXML, nodes, windows, credentials, clean, options)
 
                 if origXML is not None:
                     jobXML = applyHooks(jenkinsJobPostUpdate, jobXML, info)
@@ -1331,7 +1356,7 @@ def doJenkinsPush(recipes, argv):
 
                 # hash is based on unmerged config to detect just our changes
                 newJobHash = hashlib.sha1(applyHooks(jenkinsJobCreate,
-                    job.dumpXML(None, nodes, windows, credentials, clean),
+                    job.dumpXML(None, nodes, windows, credentials, clean, options),
                     info)).digest()
                 newJobConfig = {
                     'hash' : newJobHash,
@@ -1444,6 +1469,8 @@ def doJenkinsSetOptions(recipes, argv):
     parser.add_argument("--reset", action='store_true', default=False,
                         help="Reset all options to their default")
     parser.add_argument("-n", "--nodes", help="Set label for Jenkins Slave")
+    parser.add_argument("-o", default=[], action='append', dest='options',
+                        help="Set extended Jenkins options")
     parser.add_argument("-p", "--prefix", help="Set prefix for jobs")
     parser.add_argument("--add-root", default=[], action='append',
                         help="Add new root package")
@@ -1509,6 +1536,7 @@ def doJenkinsSetOptions(recipes, argv):
             "credentials" : None,
             "clean" : False,
             "keep" : False,
+            "options" : {},
         })
 
     if args.nodes is not None:
@@ -1541,6 +1569,15 @@ def doJenkinsSetOptions(recipes, argv):
         config['clean'] = args.clean
     if args.keep is not None:
         config['keep'] = args.keep
+    options = config.setdefault('options', {})
+    for i in args.options:
+        (opt, sep, val) = i.partition("=")
+        if sep != "=":
+            parser.error("Malformed plugin option: "+i)
+        if val == "":
+            if opt in options: del options[opt]
+        else:
+            options[opt] = val
 
     BobState().setJenkinsConfig(args.name, config)
 
