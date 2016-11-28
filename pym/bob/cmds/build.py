@@ -1103,8 +1103,8 @@ def doStatus(argv, bobRoot):
     group.add_argument('--develop', action='store_true',  dest='develop', help="Use developer mode", default=True)
     group.add_argument('--release', action='store_false', dest='develop', help="Use release mode")
 
-    parser.add_argument('-r', '--recursive', default=False, action='store_true',
-                        help="Recursively display dependencies")
+    parser.add_argument('-r', '--recursive', default=True, action='store_false',
+                        help="Do not recursively display dependencies")
     parser.add_argument('-D', default=[], action='append', dest="defines",
         help="Override default environment variable")
     parser.add_argument('-c', dest="configFile", default=[], action='append',
@@ -1113,7 +1113,7 @@ def doStatus(argv, bobRoot):
         help="Preserve environment variable")
     parser.add_argument('-E', dest="preserve_env", default=False, action='store_true',
         help="Preserve whole environment")
-    parser.add_argument('-v', '--verbose', default=1, action='count',
+    parser.add_argument('-v', '--verbose', default=2, action='count',
         help="Increase verbosity (may be specified multiple times)")
     args = parser.parse_args(argv)
 
