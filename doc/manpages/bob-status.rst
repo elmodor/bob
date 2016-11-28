@@ -41,7 +41,7 @@ Options
     Preserve whole environment
 
 ``-r, --recursive``
-    Recursively display dependencies
+    Do not recursively display dependencies
 
 ``--release``
     Use release mode
