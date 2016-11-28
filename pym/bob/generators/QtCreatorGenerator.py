@@ -159,7 +159,7 @@ def qtProjectGenerator(package, argv, extra):
     parser.add_argument('-f', '--filter', metavar="Filter",
         help="File filter. A regex for matching additional files.")
     parser.add_argument('--exclude', default=[], action='append', dest="excludes",
-            help="Packages will be excluded in QTCreator.")
+            help="Package filter. A regex for excluding packages in QTCreator.")
     parser.add_argument('--kit',
         help="Kit to use for this project")
 
