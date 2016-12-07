@@ -14,15 +14,17 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+from ..archive import getArchiver
 from ..errors import ParseError, BuildError
 from ..input import RecipeSet, walkPackagePath
 from ..state import BobState
-from ..tty import colorize, WarnOnce
+from ..tty import WarnOnce
 from ..utils import asHexStr
 from pipes import quote
 import argparse
 import ast
 import base64
+import datetime
 import getpass
 import hashlib
 import http.client
@@ -45,55 +47,6 @@ requiredPlugins = {
     "ws-cleanup" : "Jenkins Workspace Cleanup Plugin",
 }
 
-class DummyArchive:
-    """Archive that does nothing"""
-    def upload(self, step):
-        return ""
-    def download(self, step):
-        return ""
-
-class SimpleHttpArchive:
-    """HTTP archive uploader"""
-
-    def __init__(self, spec, download, upload):
-        self.__url = spec["url"]
-        self.__download = download
-        self.__upload = upload
-
-    def upload(self, step):
-        # only upload if requested
-        if not self.__upload:
-            return ""
-
-        # only upload tools if built in sandbox
-        if step.doesProvideTools() and (step.getSandbox() is None):
-            return ""
-
-        # upload with curl if file does not exist yet on server
-        return "\n" + textwrap.dedent("""\
-            # upload artifact
-            cd $WORKSPACE
-            BOB_UPLOAD_URL="{URL}/$(hexdump -e '2/1 "%02x/" 14/1 "%02x"' {BUILDID}).tgz"
-            if ! curl --output /dev/null --silent --head --fail "$BOB_UPLOAD_URL" ; then
-                curl -sSg -T {RESULT} "$BOB_UPLOAD_URL" || echo Upload failed: $?
-            fi""".format(URL=self.__url, BUILDID=quote(JenkinsJob._buildIdName(step)),
-                         RESULT=quote(JenkinsJob._tgzName(step))))
-
-    def download(self, step):
-        # only download if requested
-        if not self.__download:
-            return ""
-
-        # only download tools if built in sandbox
-        if step.doesProvideTools() and (step.getSandbox() is None):
-            return ""
-
-        return "\n" + textwrap.dedent("""\
-            BOB_DOWNLOAD_URL="{URL}/$(hexdump -e '2/1 "%02x/" 14/1 "%02x"' {BUILDID}).tgz"
-            curl -sSg --fail -o {RESULT} "$BOB_DOWNLOAD_URL" || echo Download failed: $?
-            """.format(URL=self.__url, BUILDID=quote(JenkinsJob._buildIdName(step)),
-                       RESULT=quote(JenkinsJob._tgzName(step))))
-
 
 def genHexSlice(data, i = 0):
     r = data[i:i+96]
@@ -101,6 +54,17 @@ def genHexSlice(data, i = 0):
         yield ("=" + r)
         i += 96
         r = data[i:i+96]
+
+def wrapCommandArguments(cmd, arguments):
+    ret = []
+    line = cmd
+    for arg in arguments:
+        if len(line) + len(arg) > 96:
+            ret.append(line + " \\")
+            line = "  "
+        line = line + " " + arg
+    ret.append(line)
+    return ret
 
 class SpecHasher:
     """Track digest calculation and output as spec for bob-hash-engine"""
@@ -144,6 +108,7 @@ class JenkinsJob:
         self.__checkoutSteps = {}
         self.__buildSteps = {}
         self.__packageSteps = {}
+        self.__allPackages = []
         self.__deps = {}
 
     def __getJobName(self, p):
@@ -154,6 +119,40 @@ class JenkinsJob:
 
     def isRoot(self):
         return self.__isRoot
+
+    def getDescription(self, date):
+        namesPerVariant = {}
+        packagesPerVariant = {}
+
+        for p in self.__allPackages:
+            vid = p.getPackageStep().getVariantId()
+            namesPerVariant.setdefault(vid, set()).add(p.getName())
+            packagesPerVariant.setdefault(vid, set()).add("/".join(p.getStack()))
+
+        recipe = self.__allPackages[0].getRecipe()
+        description = [
+            "<h2>Recipe</h2>",
+            "<p>Name: " + recipe.getName()
+                + "<br/>Source: " + recipe.getRecipeSet().getScmStatus()
+                + "<br/>Configured: " + date + "</p>",
+            "<h2>Packages</h2>", "<ul>"
+        ]
+        namesPerVariant = { vid : ", ".join(sorted(names)) for (vid, names)
+            in namesPerVariant.items() }
+        for (vid, names) in sorted(namesPerVariant.items(), key=lambda x: x[1]):
+            description.append("<li>" + names + "<ul>")
+            i = 0
+            allPackages = packagesPerVariant[vid]
+            for p in sorted(allPackages):
+                if i > 5:
+                    description.append("<li>... ({} more)</li>".format(len(allPackages)-i))
+                    break
+                description.append("<li>" + p + "</li>")
+                i += 1
+            description.append("</ul></li>")
+        description.append("</ul>")
+
+        return "\n".join(description)
 
     def addDependencies(self, deps):
         for dep in deps:
@@ -173,6 +172,7 @@ class JenkinsJob:
 
     def addPackageStep(self, step):
         self.__packageSteps[step.getVariantId()] = step
+        self.__allPackages.append(step.getPackage())
 
     def getPackageSteps(self):
         return self.__packageSteps.values()
@@ -183,23 +183,19 @@ class JenkinsJob:
             deps.add(self.__getJobName(d.getPackage()))
         return deps
 
-    def getShebang(self, windows):
+    def getShebang(self, windows, errexit=True):
         if windows:
-            return "#!bash -ex"
+            ret = "#!bash -x"
         else:
-            return "#!/bin/bash -ex"
+            ret = "#!/bin/bash -x"
+        if errexit:
+            ret += "e"
+        return ret
 
     def dumpStep(self, d, windows, checkIfSkip):
         cmds = []
 
         cmds.append(self.getShebang(windows))
-        if not windows:
-            # Verify umask for predictable file modes. Can be set outside of
-            # Jenkins but Bob requires that umask is everywhere the same for
-            # stable Build-IDs. Mask 0022 is enforced on local builds and in
-            # the sandbox. Check it and bail out if different.
-            cmds.append("[[ $(umask) == 0022 ]] || exit 1")
-
         if checkIfSkip:
             cmds.append("if [[ -e {} ]] ; then"
                             .format(JenkinsJob._tgzName(d.getPackage().getPackageStep())))
@@ -210,15 +206,8 @@ class JenkinsJob:
 
         if d.getJenkinsScript() is not None:
             cmds.append("mkdir -p {}".format(d.getWorkspacePath()))
-            if d.getSandbox() is not None:
-                cmds.append("_sandbox=$(mktemp -d)")
-                cmds.append("trap 'rm -rf $_sandbox' EXIT")
-                cmds.append("")
-                cmds.append("cat >$_sandbox/.script <<'BOB_JENKINS_SANDBOXED_SCRIPT'")
-            else:
-                cmds.append("cd {}".format(d.getWorkspacePath()))
-                cmds.append("")
-
+            cmds.append("_sandbox=$(mktemp -d)")
+            cmds.append("trap 'rm -rf $_sandbox' EXIT")
             if windows:
                 cmds.append("if [ ! -z ${JENKINS_HOME} ]; then")
                 cmds.append("    export JENKINS_HOME=$(echo ${JENKINS_HOME} | sed 's/\\\\/\\//g' | sed 's/://' | sed 's/^/\\//' )")
@@ -226,6 +215,8 @@ class JenkinsJob:
                 cmds.append("if [ ! -z ${WORKSPACE} ]; then")
                 cmds.append("    export WORKSPACE=$(echo ${WORKSPACE} | sed 's/\\\\/\\//g' | sed 's/://' | sed 's/^/\\//')")
                 cmds.append("fi")
+            cmds.append("")
+            cmds.append("cat >$_sandbox/.script <<'BOB_JENKINS_SANDBOXED_SCRIPT'")
 
             cmds.append("declare -A BOB_ALL_PATHS=(\n{}\n)".format("\n".join(sorted(
                 [ "    [{}]={}".format(quote(a.getPackage().getName()),
@@ -258,15 +249,23 @@ class JenkinsJob:
             cmds.append("set -o pipefail")
             cmds.append("trap 'RET=$? ; echo \"Step failed on line ${LINENO}: Exit status ${RET}; Command: ${BASH_COMMAND}\" >&2 ; exit $RET' ERR")
             cmds.append("trap 'for i in \"${_BOB_TMP_CLEANUP[@]-}\" ; do rm -f \"$i\" ; done' EXIT")
+            cmds.append("cd \"${BOB_CWD}\"")
             cmds.append("")
             cmds.append("# BEGIN BUILD SCRIPT")
             cmds.append(d.getJenkinsScript())
             cmds.append("# END BUILD SCRIPT")
+            cmds.append("BOB_JENKINS_SANDBOXED_SCRIPT")
+            cmds.append("")
 
+            # Add PATH into the environment whitelist so that env will still
+            # find bash or bob-namespace-sandbox. PATH will always be set to
+            # the correct value in the preamble.
+            envWhiteList = d.getPackage().getRecipe().getRecipeSet().envWhiteList()
+            envWhiteList |= set(['PATH'])
+            sandbox = ["-i"]
+            sandbox.extend(sorted("${{{V}+{V}=\"${V}\"}}".format(V=i) for i in envWhiteList))
             if d.getSandbox() is not None:
-                cmds.append("BOB_JENKINS_SANDBOXED_SCRIPT")
-                cmds.append("")
-                cmds.append("# invoke above script through sandbox")
+                cmds.append("# invoke above script through sandbox in controlled environment")
                 cmds.append("mounts=( )")
                 cmds.append("for i in {}/* ; do".format(d.getSandbox().getStep().getWorkspacePath()))
                 cmds.append("    mounts+=( -M \"$PWD/$i\" -m \"/${i##*/}\" )")
@@ -299,14 +298,18 @@ class JenkinsJob:
                         addDep(s)
                     else:
                         break
-                sandbox = []
+                sandbox.append("bob-namespace-sandbox")
                 sandbox.extend(["-S", "\"$_sandbox\""])
                 sandbox.extend(["-W", quote(d.getExecPath())])
                 sandbox.extend(["-H", "bob"])
                 sandbox.extend(["-d", "/tmp"])
                 sandbox.append("\"${mounts[@]}\"")
                 sandbox.append("--")
-                cmds.append("bob-namespace-sandbox {} /bin/bash -x -- /.script".format(" ".join(sandbox)))
+                sandbox.extend(["/bin/bash", "-x", "--", "/.script"])
+            else:
+                cmds.append("# invoke above script in controlled environment")
+                sandbox.extend(["bash", "-x", "$_sandbox/.script"])
+            cmds.extend(wrapCommandArguments("env", sandbox))
 
         return "\n".join(cmds)
 
@@ -323,7 +326,7 @@ class JenkinsJob:
     def _buildIdName(d):
         return d.getWorkspacePath().replace('/', '_') + ".buildid"
 
-    def dumpXML(self, orig, nodes, windows, credentials, clean, options):
+    def dumpXML(self, orig, nodes, windows, credentials, clean, options, date):
         if orig:
             root = xml.etree.ElementTree.fromstring(orig)
             builders = root.find("builders")
@@ -349,7 +352,7 @@ class JenkinsJob:
         else:
             root = xml.etree.ElementTree.Element("project")
             xml.etree.ElementTree.SubElement(root, "actions")
-            xml.etree.ElementTree.SubElement(root, "description").text = ""
+            xml.etree.ElementTree.SubElement(root, "description")
             if self.__name != self.__displayName:
                 xml.etree.ElementTree.SubElement(
                     root, "displayName").text = self.__displayName
@@ -386,6 +389,7 @@ class JenkinsJob:
                 publishers, "hudson.tasks.ArtifactArchiver")
             buildWrappers = xml.etree.ElementTree.SubElement(root, "buildWrappers")
 
+        root.find("description").text = self.getDescription(date)
         scmTrigger = xml.etree.ElementTree.SubElement(
             triggers, "hudson.triggers.SCMTrigger")
         xml.etree.ElementTree.SubElement(scmTrigger, "spec").text = options.get("scm.poll")
@@ -397,6 +401,13 @@ class JenkinsJob:
         prepareCmds = []
         prepareCmds.append(self.getShebang(windows))
         prepareCmds.append("mkdir -p .state")
+        if not windows:
+            # Verify umask for predictable file modes. Can be set outside of
+            # Jenkins but Bob requires that umask is everywhere the same for
+            # stable Build-IDs. Mask 0022 is enforced on local builds and in
+            # the sandbox. Check it and bail out if different.
+            prepareCmds.append("[[ $(umask) == 0022 ]] || exit 1")
+
         prepareCmds.append("")
         prepareCmds.append("# delete unused files and directories from workspace")
         prepareCmds.append("pruneUnused()")
@@ -431,13 +442,7 @@ class JenkinsJob:
         whiteList.extend([ JenkinsJob._buildIdName(d) for d in self.__deps.values()])
         whiteList.extend([ d.getWorkspacePath() for d in self.__checkoutSteps.values() ])
         whiteList.extend([ d.getWorkspacePath() for d in self.__buildSteps.values() ])
-        line = "pruneUnused "
-        for w in sorted(whiteList):
-            if len(line) + len(w) > 96:
-                prepareCmds.append(line + " \\")
-                line = "  "
-            line = line + " " + w
-        prepareCmds.append(line)
+        prepareCmds.extend(wrapCommandArguments("pruneUnused", sorted(whiteList)))
         prepareCmds.append("set -x")
 
         deps = sorted(self.__deps.values())
@@ -580,11 +585,15 @@ class JenkinsJob:
         # download if possible
         downloadCmds = []
         for d in sorted(self.__packageSteps.values()):
-            cmd = self.__archive.download(d)
+            # only download tools if built in sandbox
+            if d.doesProvideTools() and (d.getSandbox() is None):
+                continue
+            cmd = self.__archive.download(d, JenkinsJob._buildIdName(d), JenkinsJob._tgzName(d))
             if not cmd: continue
             downloadCmds.append(cmd)
         if downloadCmds:
-            downloadCmds.insert(0, self.getShebang(windows))
+            downloadCmds.insert(0, self.getShebang(windows, False))
+            downloadCmds.append("true # don't let downloads fail the build")
             download = xml.etree.ElementTree.SubElement(
                 builders, "hudson.tasks.Shell")
             xml.etree.ElementTree.SubElement(
@@ -607,7 +616,8 @@ class JenkinsJob:
                 "", "# pack result for archive and inter-job exchange",
                 "cd $WORKSPACE",
                 "tar zcfv {} -C {} .".format(JenkinsJob._tgzName(d), d.getWorkspacePath()),
-                self.__archive.upload(d)
+                "" if d.doesProvideTools() and (d.getSandbox() is None)
+                    else self.__archive.upload(d, JenkinsJob._buildIdName(d), JenkinsJob._tgzName(d))
             ])
             publish.append(JenkinsJob._tgzName(d))
             publish.append(JenkinsJob._buildIdName(d))
@@ -769,7 +779,7 @@ def jenkinsNamePersister(jenkins, wrapFmt):
         else:
             assert mode == 'exec'
             if step.getSandbox() is None:
-                return os.path.join("$WORKSPACE", quote(persist(step, props)))
+                return os.path.join("$PWD", quote(persist(step, props)))
             else:
                 return os.path.join("/bob", asHexStr(step.getVariantId()), "workspace")
 
@@ -779,16 +789,9 @@ def genJenkinsJobs(recipes, jenkins):
     jobs = {}
     config = BobState().getJenkinsConfig(jenkins)
     prefix = config["prefix"]
-    archiveHandler = DummyArchive()
-    upload = config.get("upload", False)
-    download = config.get("download", False)
-    if download or upload:
-        archiveSpec = recipes.archiveSpec()
-        archiveBackend = archiveSpec.get("backend", "none")
-        if archiveBackend == "http":
-            archiveHandler = SimpleHttpArchive(archiveSpec, download, upload)
-        elif archiveBackend != "none":
-            print("Ignoring unsupported archive backend:", archiveBackend)
+    archiveHandler = getArchiver(recipes)
+    archiveHandler.wantUpload(config.get("upload", False))
+    archiveHandler.wantDownload(config.get("download", False))
     nameFormatter = recipes.getHook('jenkinsNameFormatter')
     rootPackages = recipes.generatePackages(
         jenkinsNamePersister(jenkins, nameFormatter),
@@ -942,12 +945,8 @@ def doJenkinsExport(recipes, argv):
             'buildSteps' : job.getBuildSteps(),
             'packageSteps' : job.getPackageSteps()
         }
-        BobState().setAsynchronous()
-        try:
-            xml = applyHooks(jenkinsJobCreate, job.dumpXML(None, nodes, windows,
-                credentials, clean, options), info)
-        finally:
-            BobState().setSynchronous()
+        xml = applyHooks(jenkinsJobCreate, job.dumpXML(None, nodes, windows,
+            credentials, clean, options, "now"), info)
         with open(os.path.join(args.dir, job.getName()+".xml"), "wb") as f:
             f.write(xml)
 
@@ -1065,7 +1064,10 @@ class JenkinsConnection:
         self.__connection.close()
         return False
 
-    def _send(self, method, path, body=None):
+    def _send(self, method, path, body=None, headers=None):
+        if headers is None:
+            headers = self.__headers
+
         # Retry in case of BadStatusLine or OSError (broken pipe). This happens
         # sometimes if the server is under load. Running Bob again essentially
         # does that anyway...
@@ -1073,7 +1075,7 @@ class JenkinsConnection:
         while True:
             try:
                 self.__connection.request(method, self.__config["url"]["path"] + path, body,
-                                          self.__headers)
+                                          headers)
                 return self.__connection.getresponse()
             except (http.client.BadStatusLine, OSError) as e:
                 retries -= 1
@@ -1165,6 +1167,21 @@ class JenkinsConnection:
         response = self._send("POST", "job/" + name + "/disable")
         if response.status != 200 and response.status != 302:
             raise BuildError("Error disabling '{}': HTTP error: {} {}"
+                .format(name, response.status, response.reason))
+        response.read()
+
+    def setDescription(self, name, description):
+        body = urllib.parse.urlencode({"description" : description})
+        headers = self.__headers.copy()
+        headers.update({
+            "Content-Type" : "application/x-www-form-urlencoded",
+            "Accept" : "text/plain"
+        })
+        response = self._send("POST", "job/" + name + "/description", body,
+                              headers)
+        if response.status >= 400:
+            print(name, description, headers, body)
+            raise BuildError("Error setting description of '{}': HTTP error: {} {}"
                 .format(name, response.status, response.reason))
         response.read()
 
@@ -1292,6 +1309,7 @@ def doJenkinsPush(recipes, argv):
     options = config.get("options", {})
     updatedJobs = {}
     verbose = args.verbose - args.quiet
+    date = str(datetime.datetime.now())
 
     def printLine(level, job, *args):
         if level <= verbose:
@@ -1340,34 +1358,40 @@ def doJenkinsPush(recipes, argv):
                 origXML = None
 
             # calculate new job configuration
-            BobState().setAsynchronous()
             try:
                 if origXML is not None:
                     jobXML = applyHooks(jenkinsJobPreUpdate, origXML, info, True)
                 else:
                     jobXML = None
 
-                jobXML = job.dumpXML(jobXML, nodes, windows, credentials, clean, options)
+                jobXML = job.dumpXML(jobXML, nodes, windows, credentials, clean, options, date)
 
                 if origXML is not None:
                     jobXML = applyHooks(jenkinsJobPostUpdate, jobXML, info)
+                    # job hash is based on unmerged config to detect just our changes
+                    hashXML = applyHooks(jenkinsJobCreate,
+                        job.dumpXML(None, nodes, windows, credentials, clean, options, date),
+                        info)
                 else:
                     jobXML = applyHooks(jenkinsJobCreate, jobXML, info)
+                    hashXML = jobXML
 
-                # hash is based on unmerged config to detect just our changes
-                newJobHash = hashlib.sha1(applyHooks(jenkinsJobCreate,
-                    job.dumpXML(None, nodes, windows, credentials, clean, options),
-                    info)).digest()
+                # remove description from job hash
+                root = xml.etree.ElementTree.fromstring(hashXML)
+                description = root.find("description").text
+                newDescrHash = hashlib.sha1(description.encode('utf8')).digest()
+                root.find("description").text = ""
+                hashXML = xml.etree.ElementTree.tostring(root, encoding="UTF-8")
+                newJobHash = hashlib.sha1(hashXML).digest()
                 newJobConfig = {
                     'hash' : newJobHash,
                     'scheduledHash' : newJobHash,
+                    'descrHash' : newDescrHash,
                     'enabled' : True,
                 }
             except xml.etree.ElementTree.ParseError as e:
                 raise BuildError("Cannot parse XML of job '{}': {}".format(
                     name, str(e)))
-            finally:
-                BobState().setSynchronous()
 
             # configure or create job
             if name in existingJobs:
@@ -1381,6 +1405,13 @@ def doJenkinsPush(recipes, argv):
                     printNormal(name, "Set new configuration...")
                     connection.updateConfig(name, jobXML)
                     oldJobConfig['hash'] = newJobConfig['hash']
+                    oldJobConfig['descrHash'] = newJobConfig['descrHash']
+                    BobState().setJenkinsJobConfig(args.name, name, oldJobConfig)
+                elif oldJobConfig.get('descrHash') != newJobConfig['descrHash']:
+                    # just set description
+                    printInfo(name, "Update description...")
+                    connection.setDescription(name, description)
+                    oldJobConfig['descrHash'] = newJobConfig['descrHash']
                     BobState().setJenkinsJobConfig(args.name, name, oldJobConfig)
                 else:
                     printDebug(name, "Not reconfigured. Unchanged configuration.")
@@ -1388,6 +1419,7 @@ def doJenkinsPush(recipes, argv):
                 printNormal(name, "Initial creation...")
                 oldJobConfig = {
                     'hash' : newJobConfig['hash'],
+                    'descrHash' : newJobConfig['descrHash'],
                     'enabled' : True
                 }
                 if not connection.createJob(name, jobXML):
@@ -1616,12 +1648,15 @@ def doJenkins(argv, bobRoot):
     recipes.parse()
 
     if args.subcommand in availableJenkinsCmds:
+        BobState().setAsynchronous()
         try:
             availableJenkinsCmds[args.subcommand][0](recipes, args.args)
         except http.client.HTTPException as e:
             raise BuildError("HTTP error: " + str(e))
         except OSError as e:
             raise BuildError("OS error: " + str(e))
+        finally:
+            BobState().setSynchronous()
     else:
         parser.error("Unknown subcommand '{}'".format(args.subcommand))
 

@@ -275,11 +275,6 @@ extended by plugins. The following syntax is supported:
       character. The only exception is within single quotes where backslash is
       not recognized as meta character.
 
-.. note::
-   These facilities are only available if you define ``bobMinimumVersion`` to
-   at least "0.3" in your :ref:`configuration-config`. Otherwise the only available
-   substitutions are ``$VAR`` and ``${VAR}``.
-
 The following built in string functions are supported:
 
 * ``$(eq,left,right)``: Returns ``true`` if the expansions of ``left`` and
@@ -510,14 +505,11 @@ There are three common (string) attributes in all SCM specifications: ``scm``,
 ``dir`` and ``if``. By default the SCMs check out to the root of the workspace.
 You may specify any relative path in ``dir`` to checkout to this directory.
 
-By using ``if`` you can selectively enable or disable a particular SCM. Define
-``bobMinimumVersion`` to at least "0.3" in your :ref:`configuration-config` to
-enable advanced string substitutions. The string given to the ``if``-keyword is
-substituted according to :ref:`configuration-principle-subst` and the final
-string is interpreted as a boolean value (everything except the empty string,
-``0`` and ``false`` is considered true). The SCM will only be considered if the
-condition passes. The old behaviour before 0.3 is missing intentionally and
-should not be used anymore.
+By using ``if`` you can selectively enable or disable a particular SCM. The
+string given to the ``if``-keyword is substituted according to
+:ref:`configuration-principle-subst` and the final string is interpreted as a
+boolean value (everything except the empty string, ``0`` and ``false`` is
+considered true). The SCM will only be considered if the condition passes.
 
 Currently the following ``scm`` values are supported:
 
@@ -1054,25 +1046,62 @@ Example::
 archive
 ~~~~~~~
 
-Type: Dictionary
+Type: Dictionary or list of dictionaries
 
-The ``archive`` key configures the default binary artifact server that should
-be used. At least the ``backend`` key must be specified. Any further keys are
-specific to the actual backend. See the following table for supported backends
-and their configuration.
+The ``archive`` key configures the default binary artifact server(s) that
+should be used. It is either directly an archive backend entry or a list of
+archive backends. For each entry at least the ``backend`` key must be
+specified. Optionally there can be a ``flags`` key that receives a list of
+various flags, in particular for what operations the backend might be used. See
+the following list for possible flags. The default is ``[download, upload]``.
 
-=========== ==================================================================
+``download``
+    Use this archive to download artifacts. Note that you still have to
+    explicitly enable downloads on Jenkins servers. For local builds the exact
+    download behaviour depends on the build mode (release vs. develop).
+
+``upload``
+    Use this archive to upload artifacts. To actually upload to the archive the
+    build must be performed with uploads enabled (``--upload``).
+
+``nofail``
+    Don't fail the build if the upload or download from this archive fails. In
+    any case it is never an error if a download does not find the requested
+    archive on the backend. This option additionally suppresses other errors
+    such as unknown hosts or interrupted transfers.
+
+``nolocal``
+    Do not use this archive in local builds.
+
+``nojenkins``
+    Do not use this archive in Jenkins builds.
+
+Depending on the backend further specific keys are available or required. See
+the following table for supported backends and their configuration.
+
+=========== ===================================================================
 Backend     Description
-=========== ==================================================================
+=========== ===================================================================
 none        Do not use a binary repository (default).
 file        Use a local directory as binary artifact repository. The directory
             is specified in the ``path`` key as absolute path.
 http        Uses a HTTP server as binary artifact repository. The server has to
             support the HEAD, PUT and GET methods. The base URL is given in the
             ``url`` key.
-=========== ==================================================================
+shell       This backend can be used to execute commands that do the actual up-
+            or download. A ``download`` and/or ``upload`` key provides the
+            commands that are executed for the respective operation. The
+            configured commands are executed by bash and are expected to copy
+            between the local archive (given as ``$BOB_LOCAL_ARTIFACT``) and
+            the remote one (available as ``$BOB_REMOTE_ARTIFACT``). See the
+            example below for a possible use with ``scp``.
+=========== ===================================================================
 
-The directory layouts of the ``file`` and the ``http`` backends are compatible.
+The directory layouts of the ``file``, ``http`` and ``shell``
+(``$BOB_REMOTE_ARTIFACT``) backends are compatible. If multiple download
+backends are available they will be tried in order until a matching artifact is
+found. All available upload backends are used for uploading artifacts. Any
+failing upload will fail the whole build.
 
 .. note::
    The uploaded artifacts do not have any metadata attached to them yet.
@@ -1085,6 +1114,19 @@ Example::
    archive:
       backend: http
       url: "http://localhost:8001/upload"
+
+It is also possible to use separate methods for upload and download::
+
+    archive:
+        -
+            backend: http
+            url: "http://localhost:8001/archive"
+            use: [download]
+        -
+            backend: shell
+            upload: "scp -q ${BOB_LOCAL_ARTIFACT} localhost:archive/${BOB_REMOTE_ARTIFACT}"
+            download: "scp -q localhost:archive/${BOB_REMOTE_ARTIFACT} ${BOB_LOCAL_ARTIFACT}"
+            use: [upload]
 
 scmOverrides
 ~~~~~~~~~~~~
