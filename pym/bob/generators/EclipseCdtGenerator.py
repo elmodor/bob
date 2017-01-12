@@ -294,8 +294,9 @@ def eclipseCdtGenerator(package, argv, extra):
         # Generate buildme
         buildMe = []
         buildMe.append("#!/bin/sh")
-        buildMe.append('bob dev "$@" ' + quote(extra) + ' ' + quote(project))
-        projectCmd = "bob project -n eclipseCdt " + quote(project) + " -u --destination " + quote(destination) + ' --name ' + quote(projectName)
+        buildMe.append('bob dev "$@" ' + extra + ' ' + quote(project))
+        projectCmd = "bob project -n " + extra + " eclipseCdt " + quote(project) + \
+            " -u --destination " + quote(destination) + ' --name ' + quote(projectName)
         for i in args.additional_includes:
             projectCmd += " -I " + quote(i)
         buildMe.append(projectCmd)
@@ -310,9 +311,11 @@ def eclipseCdtGenerator(package, argv, extra):
             packageDir = package.getPackageStep().getWorkspacePath()
             for root, directory, filenames in os.walk(packageDir):
                 for filename in filenames:
-                    ftype = magic.from_file(os.path.join(root, filename))
-                    if 'executable' in ftype and 'x86' in ftype:
-                        createLaunchFile(open(os.path.join(destination, filename + ".launch"), 'w'),
+                    try:
+                        ftype = magic.from_file(os.path.join(root, filename))
+                        if 'executable' in ftype and 'x86' in ftype:
+                            createLaunchFile(open(os.path.join(destination, filename + ".launch"), 'w'),
                                 os.path.join(os.getcwd(), root, filename), projectName)
-
+                    except OSError:
+                        pass
 

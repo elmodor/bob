@@ -312,7 +312,8 @@ def qtProjectGenerator(package, argv, extra):
         buildMe = []
         buildMe.append("#!/bin/sh")
         buildMe.append('bob dev "$@" ' + extra + ' ' + quote(project))
-        projectCmd = "bob project -n qt-creator " + quote(project) + " -u --destination " + quote(destination) + ' --name ' + quote(projectName)
+        projectCmd = "bob project -n " + extra + " qt-creator " + quote(project) + \
+            " -u --destination " + quote(destination) + ' --name ' + quote(projectName)
         # only add arguments which are relevant for .files or .includes. All other files are only modified if not build with
         # update only.
         for i in args.additional_includes:
@@ -414,9 +415,12 @@ def qtProjectGenerator(package, argv, extra):
             packageDir = package.getPackageStep().getWorkspacePath()
             for root, directory, filenames in os.walk(packageDir):
                 for filename in filenames:
-                    ftype = magic.from_file(os.path.join(root, filename))
-                    if 'executable' in ftype and 'x86' in ftype:
-                        runTargets.append(RunStep(os.path.join(os.getcwd(), root), filename))
+                    try:
+                        ftype = magic.from_file(os.path.join(root, filename))
+                        if 'executable' in ftype and 'x86' in ftype:
+                            runTargets.append(RunStep(os.path.join(os.getcwd(), root), filename))
+                    except OSError:
+                        pass
 
         with open(sharedFile, 'w') as sharedFile:
             sharedFile.write(template_head)
