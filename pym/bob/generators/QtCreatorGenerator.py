@@ -160,8 +160,8 @@ def qtProjectGenerator(package, argv, extra):
         help="File filter. A regex for matching additional files.")
     parser.add_argument('--exclude', default=[], action='append', dest="excludes",
             help="Package filter. A regex for excluding packages in QTCreator.")
-    parser.add_argument('--use-only', default=[], action='append', dest="useonly",
-            help="Use only package filter. A regex for oncluding only the specified packages in QTCreator.")
+    parser.add_argument('--include', default=[], action='append', dest="include",
+            help="Include package filter. A regex for including only the specified packages in QTCreator.")
     parser.add_argument('--kit',
         help="Kit to use for this project")
 
@@ -179,8 +179,8 @@ def qtProjectGenerator(package, argv, extra):
         for e in args.excludes:
             excludes.append(re.compile(e))
 
-    if args.useonly:
-        for e in args.useonly:
+    if args.include:
+        for e in args.include:
             excludes.append(re.compile(r"^((?!"+e+").)*$"))
 
     getCheckOutDirs(package, excludes, dirs)
@@ -323,9 +323,9 @@ def qtProjectGenerator(package, argv, extra):
         if args.excludes:
             for e in args.excludes:
                 projectCmd += " --exclude " + quote(e)
-        if args.useonly:
-            for e in args.useonly:
-                projectCmd += "--use-only " + quote(e)
+        if args.include:
+            for e in args.include:
+                projectCmd += "--include " + quote(e)
 
         buildMe.append(projectCmd)
         generateFile(buildMe, buildMeFile)

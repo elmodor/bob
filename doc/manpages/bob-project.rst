@@ -94,7 +94,7 @@ QtCreator project generator
     bob project qt-project <package> [-h] [-u] [--buildCfg BUILDCFG] [--overwrite]
                            [--destination DEST] [--name NAME]
                            [-I ADDITIONAL_INCLUDES] [-f Filter]
-                           [--exclude Excludes] [--use-only UseOnly] [--kit KIT]
+                           [--exclude Excludes] [--include Includes] [--kit KIT]
 
 The QtCreator project generator has the following specific options. They have
 to be passed on the command line *after* the package name.
@@ -111,8 +111,12 @@ to be passed on the command line *after* the package name.
 ``--exclude Excludes``
     Package filter. A regex for excluding packages in QTCreator.
 
-``--use-only UseOnly``
-    Use only package filter. A regex for oncluding only the specified packages in QTCreator.
+``--include Includes``
+    Include package filter. A regex for including only the specified packages in QTCreator.
+    Use single quotes to specify your regex. For exmaple: --include 'foobar-.*'
+    You can also mix the Includes with the Excludes. In this case always use the Includes option beforehand.
+    For example: --include 'foobar-.*' --exclude 'foobar-baz' This will ensure you only include packages
+    wtih foobar-* but excludes the foobar-baz package.
 
 ``-I ADDITIONAL_INCLUDES``
     Additional include directories. (added recursive starting from this directory)
