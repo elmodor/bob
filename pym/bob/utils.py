@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from .errors import BuildError
+from .errors import BuildError, ParseError
 from binascii import hexlify
 from tempfile import NamedTemporaryFile
 import hashlib
@@ -68,10 +68,10 @@ def emptyDirectory(path):
         raise BuildError("Error cleaning '"+path+"': " + str(e))
 
 # Compare versions. Not strictly according to semver but enough for us.
-def compareVersion(left, right):
+def compareVersion(origLeft, origRight):
     # Strip any suffix
-    left = left.partition("-")[0]
-    right = right.partition("-")[0]
+    left = origLeft.partition("-")[0]
+    right = origRight.partition("-")[0]
 
     def cmp(l, r):
         if (len(l) == 0) and (len(r) == 0): return 0
@@ -84,7 +84,11 @@ def compareVersion(left, right):
         else:
             return cmp(l[1:], r[1:])
 
-    return cmp(left.split("."), right.split("."))
+    try:
+        return cmp(left.split("."), right.split("."))
+    except ValueError:
+        raise ParseError("Cannot compare version numbers ('{}' vs. '{}'): bad format!"
+                            .format(origLeft, origRight))
 
 ### directory hashing ###
 
@@ -228,11 +232,15 @@ class DirHasher:
         def check(self, prefix, name, st, process):
             return process(os.path.join(prefix, name))
 
-    def __init__(self, basePath=None):
+    def __init__(self, basePath=None, ignoreDirs=None):
         if basePath:
             self.__index = DirHasher.FileIndex(basePath)
         else:
             self.__index = DirHasher.NullIndex()
+        if ignoreDirs:
+            self.__ignoreDirs = DirHasher.IGNORE_DIRS | frozenset(os.fsencode(i) for i in ignoreDirs)
+        else:
+            self.__ignoreDirs = DirHasher.IGNORE_DIRS
 
     def __hashEntry(self, prefix, entry, file, s):
         if stat.S_ISREG(s.st_mode):
@@ -274,7 +282,7 @@ class DirHasher:
                 s = os.lstat(os.path.join(prefix, e))
                 if stat.S_ISDIR(s.st_mode):
                     # skip useless directories
-                    if f in DirHasher.IGNORE_DIRS: continue
+                    if f in self.__ignoreDirs: continue
                     # add training '/' for directores for correct sorting
                     f = f + os.fsencode(os.path.sep)
                 else:
@@ -297,8 +305,8 @@ class DirHasher:
         finally:
             self.__index.close()
 
-def hashDirectory(path, index=None):
-    return DirHasher(index).hashDirectory(path)
+def hashDirectory(path, index=None, ignoreDirs=None):
+    return DirHasher(index, ignoreDirs).hashDirectory(path)
 
 def binLstat(path):
     st = os.lstat(path)
