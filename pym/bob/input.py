@@ -669,9 +669,9 @@ class Sandbox:
         """Return True if the sandbox is used in the current build configuration."""
         return self.enabled
 
-def diffTools(upperTools, argTools, upperPackage):
+def diffTools(upperTools, argTools, upperPackage, relevantTools):
     ret = {}
-    for name in (set(upperTools.keys()) | set(argTools.keys())):
+    for name in ((set(upperTools.keys()) | set(argTools.keys())) & relevantTools):
         if name not in argTools:
             # filtered tool
             ret[name] = None
@@ -721,7 +721,9 @@ class CoreStepRef:
         argStack = argPackage.getStack()
         self.stackAdder = argStack[stackPrefixLen:]
 
-        self.inputTools = diffTools(upperPackage._getInputTools(), argPackage._getInputTools(), upperPackage)
+        self.inputTools = diffTools(upperPackage._getInputTools(),
+                                    argPackage._getInputTools(),
+                                    upperPackage, argPackage._getTouchedTools())
         self.inputSandbox = diffSandbox(upperPackage._getInputSandboxRaw(), argPackage._getInputSandboxRaw(), upperPackage)
 
     def toStep(self, pathFormatter, upperPackage):
@@ -736,13 +738,14 @@ class CoreStepRef:
 class CoreStep(metaclass=ABCMeta):
     __slots__ = ( "package", "label", "tools", "digestEnv", "env", "args",
         "shared", "doesProvideTools", "providedEnv", "providedTools",
-        "providedDeps", "providedSandbox", "variantId" )
+        "providedDeps", "providedSandbox", "variantId", "sandbox" )
 
-    def __init__(self, step, label, tools, digestEnv, env, args, shared):
+    def __init__(self, step, label, tools, sandbox, digestEnv, env, args, shared):
         package = step.getPackage()
         self.package = package._getCorePackage()
         self.label = label
         self.tools = list(tools.keys())
+        self.sandbox = sandbox is not None
         self.digestEnv = digestEnv
         self.env = env
         self.args = [ CoreStepRef(package, a) for a in args ]
@@ -761,12 +764,14 @@ class CoreStep(metaclass=ABCMeta):
         package = Package()
         package.reconstruct(self.package, pathFormatter, stack, inputTools, inputSandbox)
         step = self._createStep(package)
-        step.reconstruct(package, self, pathFormatter, package._getSandboxRaw())
+        step.reconstruct(package, self, pathFormatter,
+            package._getSandboxRaw() if self.sandbox else None)
         return step
 
     def getStepOfPackage(self, package, pathFormatter):
         step = self._createStep(package)
-        step.reconstruct(package, self, pathFormatter, package._getSandboxRaw())
+        step.reconstruct(package, self, pathFormatter,
+            package._getSandboxRaw() if self.sandbox else None)
         return step
 
 class Step(metaclass=ABCMeta):
@@ -800,8 +805,8 @@ class Step(metaclass=ABCMeta):
         self.__providedSandbox = None
 
         # will call back to us!
-        self._coreStep = self._createCoreStep(label, tools, digestEnv, env,
-            args, shared)
+        self._coreStep = self._createCoreStep(label, tools, sandbox, digestEnv,
+            env, args, shared)
 
     def reconstruct(self, package, coreStep, pathFormatter, sandbox):
         self.__package = package
@@ -834,7 +839,7 @@ class Step(metaclass=ABCMeta):
         return self.getVariantId() >= other.getVariantId()
 
     @abstractmethod
-    def _createCoreStep(self, label, tools, digestEnv, env, args, shared):
+    def _createCoreStep(self, label, tools, sandbox, digestEnv, env, args, shared):
         pass
 
     def _getCoreStep(self):
@@ -864,17 +869,19 @@ class Step(metaclass=ABCMeta):
         """
         pass
 
-    @abstractmethod
     def isDeterministic(self):
         """Return whether the step is deterministic.
 
         Checkout steps that have a script are considered indeterministic unless
         the recipe declares it otherwise (checkoutDeterministic). Then the SCMs
-        are checked if they all consider themselves deterministic.
+        are checked if they all consider themselves deterministic. Build and
+        package steps are always deterministic.
 
-        Build and package steps are always deterministic.
+        The determinism is defined recursively for all arguments, tools and the
+        sandbox of the step too. That is, the step is only deterministic if all
+        its dependencies and this step itself is deterministic.
         """
-        pass
+        return all(arg.isDeterministic() for arg in self.getAllDepSteps())
 
     def isValid(self):
         """Returns True if this step is valid, False otherwise."""
@@ -928,8 +935,9 @@ class Step(metaclass=ABCMeta):
         for (key, val) in sorted(self._coreStep.digestEnv.items()):
             h.update(struct.pack("<II", len(key), len(val)))
             h.update((key+val).encode('utf8'))
-        h.update(struct.pack("<I", len(self.getArguments())))
-        for arg in self.getArguments():
+        args = [ a for a in self.getArguments() if a.isValid() ]
+        h.update(struct.pack("<I", len(args)))
+        for arg in args:
             d = calculate(arg)
             if d is None: return None
             h.update(d)
@@ -984,19 +992,6 @@ class Step(metaclass=ABCMeta):
             h.update(b'\x00' * 20)
 
         return h.digest()
-
-    def getBuildId(self):
-        """Return static Build-Id of this Step.
-
-        The Build-Id represents the expected result of the Step. This method
-        will return None if the Build-Id cannot be determined in advance.
-        """
-        try:
-            ret = self.__buildId
-        except AttributeError:
-            ret = self.__buildId = self.getDigest(lambda step: step.getBuildId(), True) \
-                                    if self.isDeterministic() else None
-        return ret
 
     def getSandbox(self):
         """Return Sandbox used in this Step.
@@ -1205,8 +1200,8 @@ class CheckoutStep(Step):
 
         return self
 
-    def _createCoreStep(self, label, tools, digestEnv, env, args, shared):
-        return CoreCheckoutStep(self, label, tools, digestEnv, env, args, shared)
+    def _createCoreStep(self, label, tools, sandbox, digestEnv, env, args, shared):
+        return CoreCheckoutStep(self, label, tools, sandbox, digestEnv, env, args, shared)
 
     def isCheckoutStep(self):
         return True
@@ -1242,7 +1237,9 @@ class CheckoutStep(Step):
         return dirs
 
     def isDeterministic(self):
-        return self._coreStep.deterministic and all([ s.isDeterministic() for s in self._coreStep.scmList ])
+        return ( self._coreStep.deterministic and
+                 all([ s.isDeterministic() for s in self._coreStep.scmList ]) and
+                 super().isDeterministic() )
 
 class RegularStep(Step):
     def construct(self, package, pathFormatter, sandbox, label, script=(None, None),
@@ -1261,10 +1258,6 @@ class RegularStep(Step):
     def getDigestScript(self):
         return self._coreStep.digestScript
 
-    def isDeterministic(self):
-        """Regular steps are assumed to be deterministic."""
-        return True
-
 class CoreBuildStep(CoreStep):
     __slots__ = [ "script", "digestScript" ]
 
@@ -1280,8 +1273,8 @@ class BuildStep(RegularStep):
                           digestEnv, env, tools, args)
         return self
 
-    def _createCoreStep(self, label, tools, digestEnv, env, args, shared):
-        return CoreBuildStep(self, label, tools, digestEnv, env, args, shared)
+    def _createCoreStep(self, label, tools, sandbox, digestEnv, env, args, shared):
+        return CoreBuildStep(self, label, tools, sandbox, digestEnv, env, args, shared)
 
     def isBuildStep(self):
         return True
@@ -1301,8 +1294,8 @@ class PackageStep(RegularStep):
                           digestEnv, env, tools, args, shared)
         return self
 
-    def _createCoreStep(self, label, tools, digestEnv, env, args, shared):
-        return CorePackageStep(self, label, tools, digestEnv, env, args, shared)
+    def _createCoreStep(self, label, tools, sandbox, digestEnv, env, args, shared):
+        return CorePackageStep(self, label, tools, sandbox, digestEnv, env, args, shared)
 
     def isPackageStep(self):
         return True
@@ -1310,7 +1303,8 @@ class PackageStep(RegularStep):
 
 class CorePackage:
     __slots__ = ("name", "recipe", "directDepSteps", "indirectDepSteps",
-        "states", "tools", "sandbox", "checkoutStep", "buildStep", "packageStep")
+        "states", "tools", "sandbox", "checkoutStep", "buildStep", "packageStep",
+        "touchedTools")
 
     def __init__(self, package, name, recipe, directDepSteps, indirectDepSteps, states):
         self.name = name
@@ -1337,7 +1331,7 @@ class Package(object):
 
     def construct(self, name, stack, pathFormatter, recipe,
                   directDepSteps, indirectDepSteps, states, inputTools,
-                  allTools, inputSandbox, sandbox):
+                  allTools, inputSandbox, sandbox, touchedTools):
         self.__stack = stack
         self.__pathFormatter = pathFormatter
         self.__directDepSteps = directDepSteps
@@ -1357,7 +1351,8 @@ class Package(object):
         self._setPackageStep(PackageStep().construct(self, pathFormatter))
 
         # calculate local tools and sandbox
-        self.__corePackage.tools = diffTools(inputTools, allTools, self)
+        self.__corePackage.touchedTools = set(touchedTools)
+        self.__corePackage.tools = diffTools(inputTools, allTools, self, self.__corePackage.touchedTools)
         self.__corePackage.sandbox = diffSandbox(inputSandbox, sandbox, self)
 
         return self
@@ -1373,6 +1368,9 @@ class Package(object):
         self.__sandbox = patchSandbox(inputSandbox, corePackage.sandbox, pathFormatter, self)
 
         return self
+
+    def _getTouchedTools(self):
+        return self.__corePackage.touchedTools
 
     def _getCorePackage(self):
         return self.__corePackage
@@ -1985,10 +1983,14 @@ class Recipe(object):
         # filter duplicate results, fail on different variants of same package
         self.__filterDuplicateSteps(results)
 
+        # record used environment and tools
+        env.touch(self.__packageVars | self.__packageVarsWeak)
+        tools.touch(self.__toolDepPackage)
+
         # create package
         p = Package().construct(self.__packageName, stack, pathFormatter, self,
             directPackages, indirectPackages, states, inputTools.detach(), tools.detach(),
-            inputSandbox, sandbox)
+            inputSandbox, sandbox, tools.touchedKeys())
 
         # optional checkout step
         if self.__checkout != (None, None, []):
@@ -2023,10 +2025,6 @@ class Recipe(object):
             [buildStep], self.__shared)
         p._setPackageStep(packageStep)
 
-        # record used environment and tools
-        env.touch(self.__packageVars | self.__packageVarsWeak)
-        tools.touch(self.__toolDepPackage)
-
         # provide environment
         provideEnv = {}
         for (key, value) in self.__provideVars.items():
@@ -2058,7 +2056,7 @@ class Recipe(object):
         for s in states.values(): s.onFinish(env, tools, self.__properties, p)
 
         if self.__shared:
-            if packageStep.getBuildId() is None:
+            if not packageStep.isDeterministic():
                 raise ParseError("Shared packages must be deterministic!")
 
         # remember calculated package
@@ -2663,7 +2661,7 @@ class RecipeSet:
         states = { n:s() for (n,s) in self.__states.items() }
         rootPkg = Package()
         rootPkg.construct("<root>", [], nameFormatter, None, [], [], states,
-            {}, {}, None, None)
+            {}, {}, None, None, [])
         try:
             with open(cacheName, "rb") as f:
                 persistedCacheKey = f.read(len(cacheKey))

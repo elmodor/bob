@@ -1,0 +1,10 @@
+depends:
+    - lib2
+
+buildScript: "true"
+packageScript: |
+    echo "libh" > lib.txt
+
+provideDeps:
+    - lib2
+

@@ -577,6 +577,15 @@ esac
                     BobState().setDirectoryState(prettySrcPath,
                         { d:s for (d,s) in checkoutState.items() if d is not None })
 
+                    # check that new checkouts do not collide with old stuff in workspace
+                    for scmDir in checkoutState.keys():
+                        if scmDir is None or scmDir == ".": continue
+                        if oldCheckoutState.get(scmDir) is not None: continue
+                        scmPath = os.path.normpath(os.path.join(prettySrcPath, scmDir))
+                        if os.path.exists(scmPath):
+                            raise BuildError("New SCM checkout '{}' collides with existing file in workspace '{}'!"
+                                                .format(scmDir, prettySrcPath))
+
                     # Forge checkout result before we run the step again.
                     # Normally the correct result is set directly after the
                     # checkout finished. But if the step fails and the user
@@ -618,8 +627,8 @@ esac
             (prettyBuildPath, created) = self._constructDir(buildStep, "build")
             oldBuildDigest = BobState().getDirectoryState(prettyBuildPath)
             if created or (buildDigest != oldBuildDigest):
-                if (oldBuildDigest is not None) and (buildDigest != oldBuildDigest):
-                    # build something different -> prune workspace
+                # not created but exists -> something different -> prune workspace
+                if not created and os.path.exists(prettyBuildPath):
                     print(colorize("   PRUNE     {} (recipe changed)".format(prettyBuildPath), "33"))
                     emptyDirectory(prettyBuildPath)
                 # invalidate build step
@@ -668,8 +677,8 @@ esac
             (prettyPackagePath, created) = self._constructDir(packageStep, "dist")
             oldPackageDigest = BobState().getDirectoryState(prettyPackagePath)
             if created or (packageDigest != oldPackageDigest):
-                if (oldPackageDigest is not None) and (packageDigest != oldPackageDigest):
-                    # package something different -> prune workspace
+                # not created but exists -> something different -> prune workspace
+                if not created and os.path.exists(prettyPackagePath):
                     print(colorize("   PRUNE     {} (recipe changed)".format(prettyPackagePath), "33"))
                     emptyDirectory(prettyPackagePath)
                 # invalidate result if folder was created
@@ -679,33 +688,54 @@ esac
             if packageDigest != oldPackageDigest:
                 BobState().setDirectoryState(prettyPackagePath, packageDigest)
 
-            # Can we just download the result? If we download a package the
-            # Build-Id is stored as input hash. In this case we have to make
-            # sure that the Build-Id is still the same. If the input hash is
-            # not a bytes object we have apparently not downloaded the result.
-            # Dont' mess with it and fall back to regular build machinery.
-            packageDone = False
-            packageExecuted = False
+            # Can we theoretically download the result? Exclude packages that
+            # provide host tools when not building in a sandbox. Try to
+            # determine a build-id for all other artifacts.
             if packageStep.doesProvideTools() and (packageStep.getSandbox() is None):
-                # Exclude packages that provide host tools when not building in a sandbox
                 packageBuildId = None
-            elif checkoutOnly:
-                # Just the sources! Don't trigger a download dude...
-                packageBuildId = None
-            elif self.__archive.canDownloadLocal() or self.__archive.canUploadLocal():
-                # up- or download with valid package -> get BuildId
-                packageBuildId = self._getBuildId(packageStep, depth)
             else:
-                packageBuildId = None
+                packageBuildId = self._getBuildId(packageStep, depth)
 
-            if packageBuildId and (depth >= self.__downloadDepth):
-                oldInputHashes = BobState().getInputHashes(prettyPackagePath)
-                # prune directory if we previously downloaded something different
-                if isinstance(oldInputHashes, bytes) and (oldInputHashes != packageBuildId):
+            # If we download the package in the last run the Build-Id is stored
+            # as input hash. Otherwise the input hashes of the package step is
+            # a list with the buildId as first element. Split that off for the
+            # logic below...
+            oldInputBuildId = BobState().getInputHashes(prettyPackagePath)
+            if (isinstance(oldInputBuildId, list) and (len(oldInputBuildId) >= 1)):
+                oldInputHashes = oldInputBuildId[1:]
+                oldInputBuildId = oldInputBuildId[0]
+                oldWasDownloaded = False
+            elif isinstance(oldInputBuildId, bytes):
+                oldWasDownloaded = True
+                oldInputHashes = None
+            else:
+                # created by old Bob version or new workspace
+                oldInputHashes = oldInputBuildId
+                oldWasDownloaded = False
+
+            # If possible try to download the package. If we downloaded the
+            # package in the last run we have to make sure that the Build-Id is
+            # still the same. The overall behaviour should look like this:
+            #
+            # new workspace -> try download
+            # previously built
+            #   still same build-id -> normal build
+            #   build-id changed -> prune and try download, fall back to build
+            # previously downloaded
+            #   still same build-id -> done
+            #   build-id changed -> prune and try download, fall back to build
+            workspaceChanged = False
+            wasDownloaded = False
+            if ( (not checkoutOnly) and packageBuildId and self.__archive.canDownloadLocal()
+                 and (depth >= self.__downloadDepth) ):
+                # prune directory if we previously downloaded/built something different
+                if (oldInputBuildId is not None) and (oldInputBuildId != packageBuildId):
                     print(colorize("   PRUNE     {} (build-id changed)".format(prettyPackagePath), "33"))
                     emptyDirectory(prettyPackagePath)
                     BobState().delInputHashes(prettyPackagePath)
                     BobState().delResultHash(prettyPackagePath)
+                    oldInputBuildId = None
+                    oldInputHashes = None
 
                 # Try to download the package if the directory is currently
                 # empty. If the directory holds a result and was downloaded it
@@ -713,14 +743,17 @@ esac
                 if BobState().getResultHash(prettyPackagePath) is None:
                     if self.__archive.downloadPackage(packageBuildId, prettyPackagePath):
                         BobState().setInputHashes(prettyPackagePath, packageBuildId)
-                        packageDone = True
-                        packageExecuted = True
-                elif isinstance(oldInputHashes, bytes):
+                        workspaceChanged = True
+                        wasDownloaded = True
+                elif oldWasDownloaded:
                     self._info("   PACKAGE   skipped (deterministic output in {})".format(prettyPackagePath))
-                    packageDone = True
+                    wasDownloaded = True
 
-            # package it if needed
-            if not packageDone:
+            # Run package step if we have not yet downloaded the package or if
+            # downloads are not possible anymore. Even if the package was
+            # previously downloaded the oldInputHashes will be None to trigger
+            # an actual build.
+            if not wasDownloaded:
                 # depth first
                 self.cook(packageStep.getAllDepSteps(), packageStep.getPackage(),
                           checkoutOnly, depth+1)
@@ -729,7 +762,7 @@ esac
                     for i in packageStep.getArguments() if i.isValid() ]
                 if checkoutOnly:
                     self._info("   PACKAGE   skipped due to --checkout-only ({})".format(prettyPackagePath))
-                elif (not self.__force) and (BobState().getInputHashes(prettyPackagePath) == packageInputHashes):
+                elif (not self.__force) and (oldInputHashes == packageInputHashes):
                     self._info("   PACKAGE   skipped (unchanged input for {})".format(prettyPackagePath))
                 else:
                     print(colorize("   PACKAGE   {}".format(prettyPackagePath), "32"))
@@ -738,28 +771,25 @@ esac
                     BobState().delInputHashes(prettyPackagePath)
                     BobState().setResultHash(prettyPackagePath, datetime.datetime.utcnow())
                     self._runShell(packageStep, "package")
-                    packageExecuted = True
+                    workspaceChanged = True
                     if packageBuildId and self.__archive.canUploadLocal():
                         self.__archive.uploadPackage(packageBuildId, prettyPackagePath)
-            else:
-                # do not change input hashes
-                packageInputHashes = BobState().getInputHashes(prettyPackagePath)
 
             # Rehash directory if content was changed
-            if packageExecuted:
+            if workspaceChanged:
                 BobState().setResultHash(prettyPackagePath, hashWorkspace(packageStep))
-                BobState().setInputHashes(prettyPackagePath, packageInputHashes)
+                if wasDownloaded:
+                    BobState().setInputHashes(prettyPackagePath, packageBuildId)
+                else:
+                    BobState().setInputHashes(prettyPackagePath, [packageBuildId] + packageInputHashes)
             self._setAlreadyRun(packageStep, checkoutOnly)
 
     def _getBuildId(self, step, depth):
         if step.isCheckoutStep():
-            bid = step.getBuildId()
-            if bid is None:
-                # do checkout
-                self.cook([step], step.getPackage(), depth)
-                # return directory hash
-                bid = BobState().getResultHash(step.getWorkspacePath())
-            return bid
+            # do checkout
+            self.cook([step], step.getPackage(), depth)
+            # return directory hash
+            return BobState().getResultHash(step.getWorkspacePath())
         else:
             return step.getDigest(lambda s: self._getBuildId(s, depth+1), True)
 
@@ -927,6 +957,11 @@ def doProject(argv, bobRoot):
         help="Do not build (bob dev) before generate project Files. RunTargets may not work")
     parser.add_argument('-b', dest="execute_buildonly", default=False, action='store_true',
         help="Do build only (bob dev -b) before generate project Files. No checkout")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--sandbox', action='store_true', default=False,
+        help="Enable sandboxing")
+    group.add_argument('--no-sandbox', action='store_false', dest='sandbox',
+        help="Disable sandboxing")
     args = parser.parse_args(argv)
 
     defines = {}
@@ -952,7 +987,7 @@ def doProject(argv, bobRoot):
     developPersister = recipes.getHook('developNamePersister')
     nameFormatter = developPersister(nameFormatter)
     nameFormatter = LocalBuilder.makeRunnable(nameFormatter)
-    rootPackages = recipes.generatePackages(nameFormatter, defines)
+    rootPackages = recipes.generatePackages(nameFormatter, defines, sandboxEnabled=args.sandbox)
     touch(rootPackages)
 
     from ..generators.QtCreatorGenerator import qtProjectGenerator
@@ -986,6 +1021,7 @@ def doProject(argv, bobRoot):
         extra.append('-e')
         extra.append(e)
     if args.preserve_env: extra.append('-E')
+    if args.sandbox: extra.append('--sandbox')
 
     package = walkPackagePath(rootPackages, args.package)
 

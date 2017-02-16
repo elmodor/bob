@@ -1,0 +1,11 @@
+depends:
+    - lib2
+
+buildScript: "true"
+packageTools: [t42, t51]
+packageScript: |
+    echo "libe" > lib.txt
+
+provideDeps:
+    - lib2
+
