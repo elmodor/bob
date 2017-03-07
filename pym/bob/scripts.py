@@ -23,6 +23,9 @@ import argparse
 import sys
 import traceback
 
+# notify
+import subprocess
+
 def __build(*args, **kwargs):
      from .cmds.build import doBuild
      doBuild(*args, **kwargs)
@@ -150,6 +153,13 @@ Please open an issue at https://github.com/BobBuildTool/bob with the following b
         sys.stdout = origSysStdOut
         sys.stderr = origSysStdErr
         finalize()
+
+	# before exit print
+    command = "bob"
+    for x in sys.argv[1:]:
+        command+=" "
+        command+=str(x)
+    subprocess.Popen(['notify-send', '-u', 'normal', '-t', '10000', '-i', '/home/user/Tools/BobBuildTool_priv/doc/BOB_Logo_notify.png', 'BOB Finished!', command])
 
     return ret
 
